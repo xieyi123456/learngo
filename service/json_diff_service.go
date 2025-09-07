@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
+	"strings"
 )
 
 // JSONDiffResult 表示两个JSON之间的差异结果
@@ -16,6 +18,7 @@ type JSONDiffResult struct {
 // JSONDiffService 提供JSON差异比较的服务接口
 type JSONDiffService interface {
 	CompareJSON(json1, json2 string) (JSONDiffResult, error)
+	CompareJSONWithIgnore(json1, json2 string, ignorePaths []string) (JSONDiffResult, error)
 }
 
 // jsonDiffServiceImpl JSON差异比较服务的具体实现
@@ -28,6 +31,11 @@ func NewJSONDiffService() JSONDiffService {
 
 // CompareJSON 比较两个JSON字符串并返回它们之间的差异
 func (s *jsonDiffServiceImpl) CompareJSON(json1, json2 string) (JSONDiffResult, error) {
+	return s.CompareJSONWithIgnore(json1, json2, nil)
+}
+
+// CompareJSONWithIgnore 比较两个JSON字符串并返回它们之间的差异，支持忽略指定路径
+func (s *jsonDiffServiceImpl) CompareJSONWithIgnore(json1, json2 string, ignorePaths []string) (JSONDiffResult, error) {
 	var obj1, obj2 interface{}
 	var result JSONDiffResult
 	result.Changed = make(map[string]string)
@@ -43,13 +51,18 @@ func (s *jsonDiffServiceImpl) CompareJSON(json1, json2 string) (JSONDiffResult, 
 	}
 
 	// 比较两个对象
-	compareValues("", obj1, obj2, &result)
+	compareValues("", obj1, obj2, &result, ignorePaths)
 
 	return result, nil
 }
 
 // compareValues 递归比较两个值并记录差异
-func compareValues(path string, v1, v2 interface{}, result *JSONDiffResult) {
+func compareValues(path string, v1, v2 interface{}, result *JSONDiffResult, ignorePaths []string) {
+	// 检查当前路径是否应该被忽略
+	if shouldIgnorePath(path, ignorePaths) {
+		return
+	}
+
 	// 处理nil值
 	if v1 == nil && v2 == nil {
 		return
@@ -85,17 +98,22 @@ func compareValues(path string, v1, v2 interface{}, result *JSONDiffResult) {
 		for k, v := range t {
 			fullPath := buildPath(path, k)
 			if _, exists := m2[k]; !exists {
-				result.Removed = append(result.Removed, fullPath)
+				if !shouldIgnorePath(fullPath, ignorePaths) {
+					result.Removed = append(result.Removed, fullPath)
+				}
 			} else {
 				// 递归比较值
-				compareValues(fullPath, v, m2[k], result)
+				compareValues(fullPath, v, m2[k], result, ignorePaths)
 			}
 		}
 
 		// 检查第二个对象中存在但第一个对象中不存在的键
 		for k := range m2 {
 			if _, exists := t[k]; !exists {
-				result.Added = append(result.Added, buildPath(path, k))
+				fullPath := buildPath(path, k)
+				if !shouldIgnorePath(fullPath, ignorePaths) {
+					result.Added = append(result.Added, fullPath)
+				}
 			}
 		}
 
@@ -115,19 +133,25 @@ func compareValues(path string, v1, v2 interface{}, result *JSONDiffResult) {
 		}
 
 		for i := 0; i < minLen; i++ {
-			compareValues(fmt.Sprintf("%s[%d]", path, i), t[i], a2[i], result)
+			compareValues(fmt.Sprintf("%s[%d]", path, i), t[i], a2[i], result, ignorePaths)
 		}
 
 		// 处理数组长度不同的情况
 		if len(t) > len(a2) {
 			// 第一个数组更长，标记多余元素为移除
 			for i := len(a2); i < len(t); i++ {
-				result.Removed = append(result.Removed, fmt.Sprintf("%s[%d]", path, i))
+				arrayPath := fmt.Sprintf("%s[%d]", path, i)
+				if !shouldIgnorePath(arrayPath, ignorePaths) {
+					result.Removed = append(result.Removed, arrayPath)
+				}
 			}
 		} else if len(t) < len(a2) {
 			// 第二个数组更长，标记多余元素为新增
 			for i := len(t); i < len(a2); i++ {
-				result.Added = append(result.Added, fmt.Sprintf("%s[%d]", path, i))
+				arrayPath := fmt.Sprintf("%s[%d]", path, i)
+				if !shouldIgnorePath(arrayPath, ignorePaths) {
+					result.Added = append(result.Added, arrayPath)
+				}
 			}
 		}
 
@@ -145,4 +169,44 @@ func buildPath(parentPath, key string) string {
 		return key
 	}
 	return fmt.Sprintf("%s.%s", parentPath, key)
+}
+
+// shouldIgnorePath 检查给定路径是否应该被忽略，支持数组通配符 [*]
+func shouldIgnorePath(path string, ignorePaths []string) bool {
+	if ignorePaths == nil {
+		return false
+	}
+
+	for _, ignorePath := range ignorePaths {
+		if matchesPath(path, ignorePath) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesPath 检查路径是否匹配忽略模式，支持数组通配符
+func matchesPath(path, pattern string) bool {
+	// 精确匹配
+	if path == pattern {
+		return true
+	}
+
+	// 如果模式不包含通配符，则只进行精确匹配
+	if !strings.Contains(pattern, "[*]") {
+		return false
+	}
+
+	// 转换通配符模式为正则表达式
+	// 将 [*] 替换为 \[\d+\] 来匹配任意数字索引
+	regexPattern := regexp.QuoteMeta(pattern)
+	regexPattern = strings.ReplaceAll(regexPattern, `\[\*\]`, `\[\d+\]`)
+	regexPattern = "^" + regexPattern + "$"
+
+	matched, err := regexp.MatchString(regexPattern, path)
+	if err != nil {
+		return false
+	}
+
+	return matched
 }
